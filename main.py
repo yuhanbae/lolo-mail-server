@@ -149,3 +149,48 @@ async def pubsub_push(request: Request):
             requests.post(LOLO_WEBHOOK_URL, json=payload, timeout=5)
         processed.append(payload)
     return {"status": "processed", "count": len(processed), "messages": processed}
+
+class FrameRequest(BaseModel):
+    raw_hex: str
+
+
+# ---- industrial protocol decoders (verified vectors: 0CF00400->pri3/PGN F004/SA0; crc16(01 03 00 00 00 0A)=0xCDC5) ----
+def _check_key(request: Request):
+    return API_SECRET and request.headers.get("x-api-key") == API_SECRET
+
+@app.post("/v1/decode/j1939")
+def decode_j1939(payload: FrameRequest, request: Request):
+    if not _check_key(request):
+        raise HTTPException(401, "invalid api key")
+    clean = payload.raw_hex.replace(" ", "").replace("0x", "")
+    if len(clean) < 8:
+        raise HTTPException(400, "need 8 hex chars CAN ID + optional data bytes")
+    can = int(clean[:8], 16)
+    pgn = (can >> 8) & 0x3FFFF
+    pf = pgn >> 8
+    ps = pgn & 0xFF
+    da = ps if pf < 240 else 0xFF
+    pgn_n = (pgn & 0x3FF00) if pf < 240 else pgn
+    data_hex = clean[8:]
+    db = [int(data_hex[i:i+2], 16) for i in range(0, len(data_hex), 2)] if data_hex else []
+    return {"can_id_hex": f"0x{can:08X}", "priority": (can >> 26) & 0x07,
+            "pgn": pgn_n, "pgn_hex": f"0x{pgn_n:04X}", "destination_address": da,
+            "source_address": can & 0xFF, "data_length": len(db), "data_bytes": db}
+
+@app.post("/v1/decode/modbus")
+def decode_modbus(payload: FrameRequest, request: Request):
+    if not _check_key(request):
+        raise HTTPException(401, "invalid api key")
+    clean = payload.raw_hex.replace(" ", "").replace("0x", "")
+    if len(clean) < 8 or len(clean) % 2:
+        raise HTTPException(400, "invalid Modbus RTU hex")
+    raw = bytes.fromhex(clean)
+    body, rx_crc = raw[:-2], int.from_bytes(raw[-2:], "little")
+    crc = 0xFFFF
+    for b in body:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if (crc & 1) else (crc >> 1)
+    return {"slave_id": body[0], "function_code": body[1],
+            "payload_hex": body[2:].hex().upper(), "crc_valid": crc == rx_crc,
+            "expected_crc_hex": f"0x{crc:04X}", "received_crc_hex": f"0x{rx_crc:04X}"}
